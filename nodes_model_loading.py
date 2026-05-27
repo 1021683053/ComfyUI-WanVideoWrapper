@@ -25,6 +25,7 @@ try:
     from gguf import GGMLQuantizationType
 except Exception:
     pass
+from .svd_model_loader import SVDModelLoader
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -36,8 +37,8 @@ try:
 except Exception:
     PromptServer = None
 
-attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
-                    "sageattn_ultravico", "comfy"]
+attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "sageattn_3_fp4", "sageattn_3_fp8",
+                    "radial_sage_attention", "sageattn_compiled", "sageattn_ultravico", "comfy"]
 
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
@@ -1082,8 +1083,8 @@ class WanVideoModelLoader:
                 "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
 
             "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
-            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled", "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast", "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast"], {"default": "disabled",
-                            "tooltip": "Optional quantization method, 'disabled' acts as autoselect based by weights. Scaled modes only work with matching weights, _fast modes (fp8 matmul) require CUDA compute capability >= 8.9 (NVIDIA 4000 series and up), e4m3fn generally can not be torch.compiled on compute capability < 8.9 (3000 series and under)"}),
+            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled", "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast", "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast", "fp4_experimental", "fp4_scaled", "fp4_scaled_fast"], {"default": "disabled",
+                            "tooltip": "Optional quantization method, 'disabled' acts as autoselect based by weights. Scaled modes only work with matching weights, _fast modes (fp8 matmul) require CUDA compute capability >= 8.9 (NVIDIA 4000 series and up), e4m3fn generally can not be torch.compiled on compute capability < 8.9 (3000 series and under). fp4_experimental uses FP8 weights with FP4 attention (requires sageattn_3_fp4 for full acceleration). fp4_scaled/fp4_scaled_fast are for scaled FP8 models with FP4 attention."}),
             "load_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
@@ -1159,7 +1160,13 @@ class WanVideoModelLoader:
 
         gguf_reader = None
         if not gguf:
-            sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+            if SVDModelLoader.is_svd_compressed(model_path):
+                log.info("Detected SVD compressed model, loading with reconstruction...")
+                sd = SVDModelLoader.load_svd_compressed_model(
+                    model_path, device='cuda' if torch.cuda.is_available() else 'cpu'
+                )
+            else:
+                sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
         else:
             gguf_reader=[]
             from .gguf.gguf import load_gguf
@@ -1182,6 +1189,8 @@ class WanVideoModelLoader:
                 if new_key != key:
                     sd[new_key] = sd.pop(key)
 
+        sd = {k.replace(".weight_scale", ".scale_weight"): v for k, v in sd.items()}
+
         is_scaled_fp8 = False
 
         if quantization == "disabled":
@@ -1201,13 +1210,13 @@ class WanVideoModelLoader:
                         break
 
         scale_weights = {}
-        if "fp8" in quantization:
+        if "fp8" in quantization or "fp4" in quantization:
             for k, v in sd.items():
                 if k.endswith(".scale_weight") or k.endswith(".weight_scale"):
                     is_scaled_fp8 = True
                     break
 
-        if is_scaled_fp8 and "scaled" not in quantization:
+        if is_scaled_fp8 and "scaled" not in quantization and "fp4" not in quantization:
             quantization = quantization + "_scaled"
 
         if torch.cuda.is_available():
@@ -1218,9 +1227,9 @@ class WanVideoModelLoader:
                 log.warning("WARNING: Torch.compile with fp8_e4m3fn weights on CUDA compute capability < 8.9 may not be supported. Please use fp8_e5m2, GGUF or higher precision instead, or check the latest triton version that adds support for older architectures https://github.com/woct0rdho/triton-windows/releases/tag/v3.5.0-windows.post21")
 
         if is_scaled_fp8 and "scaled" not in quantization:
-            raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled'")
+            raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled', 'fp4_scaled', or 'fp4_scaled_fast'")
         if not is_scaled_fp8 and "scaled" in quantization:
-            raise ValueError("The model is not a scaled fp8 model, please disable '_scaled' in quantization")
+            raise ValueError("The model is not a scaled fp8 model, please disable '_scaled' or fp4 scaled quantization")
 
         if "vace_blocks.0.after_proj.weight" in sd and not "patch_embedding.weight" in sd:
             raise ValueError("You are attempting to load a VACE module as a WanVideo model, instead you should use the vace_model input and matching T2V base model")
@@ -1437,6 +1446,74 @@ class WanVideoModelLoader:
         with init_empty_weights():
             transformer = WanModel(**TRANSFORMER_CONFIG).eval()
 
+        def ensure_merged_multitalk_modules(reload_audio_proj_weights=False):
+            nonlocal sd, transformer
+
+            if sd is None:
+                return False
+
+            has_multitalk_proj = any(k.startswith("multitalk_audio_proj.") for k in sd.keys())
+            is_skyreels_audio = "blocks.1.audio_cross_attn.kv_linear.weight" in sd and "audio_proj.proj1.weight" in sd
+
+            # Some merged models still store the projection weights under audio_proj.*
+            if not has_multitalk_proj and not is_skyreels_audio:
+                has_plain_audio_proj = any(k.startswith("audio_proj.") for k in sd.keys())
+                has_audio_cross_attn = any(".audio_cross_attn." in k for k in sd.keys())
+                if has_plain_audio_proj and has_audio_cross_attn:
+                    sd = {
+                        (k.replace("audio_proj.", "multitalk_audio_proj.", 1) if k.startswith("audio_proj.") else k): v
+                        for k, v in sd.items()
+                    }
+                    has_multitalk_proj = True
+
+            if not has_multitalk_proj or hasattr(transformer, "multitalk_audio_proj"):
+                return False
+
+            log.info("Detected merged MultiTalk/InfiniteTalk weights, initializing audio projection modules...")
+            from .multitalk.multitalk import AudioProjModel, SingleStreamMultiAttention
+            from .wanvideo.modules.model import WanLayerNorm
+
+            if not hasattr(transformer.blocks[0], "audio_cross_attn"):
+                for block in transformer.blocks:
+                    if reload_audio_proj_weights:
+                        block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True).to(device=device, dtype=base_dtype)
+                        block.audio_cross_attn = SingleStreamMultiAttention(
+                            dim=dim,
+                            num_heads=num_heads,
+                            attention_mode=attention_mode,
+                        ).to(device=device, dtype=base_dtype)
+                    else:
+                        with init_empty_weights():
+                            block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
+                            block.audio_cross_attn = SingleStreamMultiAttention(
+                                dim=dim,
+                                num_heads=num_heads,
+                                attention_mode=attention_mode,
+                            )
+
+            if reload_audio_proj_weights:
+                audio_proj = AudioProjModel().to(device=device, dtype=base_dtype)
+            else:
+                with init_empty_weights():
+                    audio_proj = AudioProjModel()
+
+            transformer.multitalk_audio_proj = audio_proj
+            transformer.multitalk_model_type = "InfiniteTalk"
+
+            if reload_audio_proj_weights:
+                for name, value in sd.items():
+                    if name.startswith("multitalk_audio_proj."):
+                        set_module_tensor_to_device(
+                            transformer,
+                            name.replace("_orig_mod.", ""),
+                            device=transformer_load_device,
+                            dtype=base_dtype,
+                            value=value,
+                        )
+                log.info("Loaded merged MultiTalk audio projection weights after linear replacement")
+
+            return True
+
         if extra_audio_model:
             log.info("Ovi extra audio model detected, initializing...")
             TRANSFORMER_CONFIG.update({
@@ -1461,6 +1538,8 @@ class WanVideoModelLoader:
                 block.cross_attn.v_fusion = nn.Linear(block.dim, block.dim)
                 block.cross_attn.pre_attn_norm_fusion = WanLayerNorm(block.dim, elementwise_affine=True)
                 block.cross_attn.norm_k_fusion = WanRMSNorm(block.dim, eps=1e-6) if block.qk_norm else nn.Identity()
+
+        ensure_merged_multitalk_modules()
 
         #ReCamMaster
         if "blocks.0.cam_encoder.weight" in sd:
@@ -1709,13 +1788,15 @@ class WanVideoModelLoader:
         patcher.model.is_patched = False
 
         scale_weights = {}
-        if "fp8" in quantization:
+        if "fp8" in quantization or "fp4" in quantization:
             for k, v in sd.items():
                 if k.endswith(".scale_weight"):
                     scale_weights[k] = v.to(device, base_dtype)
 
-        if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast"]:
+        if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast", "fp4_experimental", "fp4_scaled", "fp4_scaled_fast"]:
             weight_dtype = torch.float8_e4m3fn
+            if "fp4" in quantization:
+                log.info("FP4 mode: using FP8 (e4m3fn) for weight storage and FP4 attention where available")
         elif quantization in ["fp8_e5m2", "fp8_e5m2_fast"]:
             weight_dtype = torch.float8_e5m2
         else:
@@ -1753,15 +1834,32 @@ class WanVideoModelLoader:
                     patcher.patches.clear()
                 transformer.patched_linear = False
                 sd = None
-            elif "scaled" in quantization or lora is not None:
+            elif "scaled" in quantization or "fp4" in quantization or lora is not None:
                 transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
                 transformer.patched_linear = True
 
+        if getattr(transformer, "patched_linear", False):
+            ensure_merged_multitalk_modules(reload_audio_proj_weights=True)
+
         if "fast" in quantization:
             if lora is not None and not merge_loras:
-                raise NotImplementedError("fp8_fast is not supported with unmerged LoRAs")
+                raise NotImplementedError("fast quantization modes are not supported with unmerged LoRAs")
             from .fp8_optimization import convert_fp8_linear
+            if "fp4" in quantization:
+                log.info("FP4 fast mode: using FP8 weights with fast matmul and FP4 attention")
+                log.info("Select 'sageattn_3_fp4' in attention_mode for full FP4 acceleration")
             convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
+        elif "fp4" in quantization:
+            if lora is not None and not merge_loras:
+                raise NotImplementedError("fp4 quantization modes are not supported with unmerged LoRAs")
+            from .fp8_optimization import convert_fp4_linear
+            if "scaled" in quantization:
+                log.info("FP4 scaled mode: using scaled FP8 weights with FP4 attention")
+                convert_fp4_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
+            else:
+                log.info("FP4 experimental mode: using FP8 weights with FP4 attention")
+                convert_fp4_linear(transformer, base_dtype, params_to_keep)
+            log.info("Select 'sageattn_3_fp4' in attention_mode for full FP4 acceleration")
 
         if vram_management_args is not None:
             if gguf:

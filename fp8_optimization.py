@@ -43,3 +43,28 @@ def convert_fp8_linear(module, base_dtype, params_to_keep={}, scale_weight_keys=
                 original_forward = submodule.forward
                 setattr(submodule, "original_forward", original_forward)
                 setattr(submodule, "forward", lambda input, m=submodule: fp8_linear_forward(m, base_dtype, input))
+
+
+def convert_fp4_linear(module, base_dtype, params_to_keep={}, scale_weight_keys=None):
+    """
+    FP4 quantization is only used for attention kernels.
+
+    Weight storage and linear matmul continue to use FP8 so we can reuse the
+    same scaled_mm path and keep compatibility with the current model layout.
+    """
+    log.info("FP4 quantization mode enabled")
+    log.info("FP4 is used for attention kernels; linear weights continue to use FP8 matmul")
+
+    if scale_weight_keys is not None:
+        log.info("Using scaled FP8 weights for improved precision")
+
+    for name, submodule in module.named_modules():
+        if not any(keyword in name for keyword in params_to_keep):
+            if isinstance(submodule, nn.Linear):
+                if scale_weight_keys is not None:
+                    scale_key = f"{name}.scale_weight"
+                    if scale_key in scale_weight_keys:
+                        setattr(submodule, "scale_weight", scale_weight_keys[scale_key].float())
+                original_forward = submodule.forward
+                setattr(submodule, "original_forward", original_forward)
+                setattr(submodule, "forward", lambda input, m=submodule: fp8_linear_forward(m, base_dtype, input))

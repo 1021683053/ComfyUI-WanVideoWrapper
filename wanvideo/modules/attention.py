@@ -71,11 +71,14 @@ except Exception:
 # sage3
 try:
     from sageattn3 import sageattn3_blackwell as sageattn_blackwell
+    SAGE3_AVAILABLE = True
 except Exception:
     try:
         from sageattn import sageattn_blackwell
+        SAGE3_AVAILABLE = True
     except Exception:
         sageattn_blackwell = attention_func_error
+        SAGE3_AVAILABLE = False
 
 try:
     from ...ultravico.sageattn.core import sage_attention as sageattn_ultravico
@@ -92,6 +95,29 @@ except Exception:
     sageattn_func_ultravico = attention_func_error
 
 
+def _sdpa_attention(q, k, v, attn_mask=None):
+    if not (q.dtype == k.dtype == v.dtype):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2).to(q.dtype),
+            v.transpose(1, 2).to(q.dtype),
+            attn_mask=attn_mask,
+        ).transpose(1, 2).contiguous()
+    return torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask
+    ).transpose(1, 2).contiguous()
+
+
+def _fallback_sage_attention(q, k, v, attn_mask=None, log_message=None):
+    if log_message is not None:
+        log.warning(log_message)
+    try:
+        return sageattn_func(q, k, v, attn_mask=attn_mask, tensor_layout="NHD").contiguous()
+    except Exception as e:
+        log.warning(f"SageAttention fallback failed: {e}, falling back to SDPA")
+        return _sdpa_attention(q, k, v, attn_mask=attn_mask)
+
+
 def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.,
     softmax_scale=None, q_scale=None, causal=False,  window_size=(-1, -1), deterministic=False, dtype=torch.bfloat16,
     attention_mode='sdpa', attn_mask=None, transformer_options={}, frame_tokens=1536, heads=128):
@@ -100,7 +126,38 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
             q_scale=q_scale, causal=causal, window_size=window_size, deterministic=deterministic, dtype=dtype, version=2 if attention_mode == 'flash_attn_2' else 3,
         )
     elif attention_mode == 'sageattn_3':
-        return sageattn_blackwell(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), per_block_mean=False).transpose(1,2).contiguous()
+        if not SAGE3_AVAILABLE or sageattn_blackwell == attention_func_error:
+            return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
+                log_message="SageAttention3 not available, falling back to regular SageAttention")
+        try:
+            return sageattn_blackwell(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), per_block_mean=False
+            ).transpose(1, 2).contiguous()
+        except Exception as e:
+            return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
+                log_message=f"SageAttention3 failed: {e}, falling back to regular SageAttention")
+    elif attention_mode == 'sageattn_3_fp4':
+        if not SAGE3_AVAILABLE or sageattn_blackwell == attention_func_error:
+            return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
+                log_message="SageAttention3 FP4 not available, falling back to regular SageAttention")
+        try:
+            return sageattn_blackwell(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), per_block_mean=True
+            ).transpose(1, 2).contiguous()
+        except Exception as e:
+            return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
+                log_message=f"SageAttention3 FP4 failed: {e}, falling back to regular SageAttention")
+    elif attention_mode == 'sageattn_3_fp8':
+        if not SAGE3_AVAILABLE or sageattn_blackwell == attention_func_error:
+            return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
+                log_message="SageAttention3 FP8 not available, falling back to regular SageAttention")
+        try:
+            return sageattn_blackwell(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), per_block_mean=True
+            ).transpose(1, 2).contiguous()
+        except Exception as e:
+            return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
+                log_message=f"SageAttention3 FP8 failed: {e}, falling back to regular SageAttention")
     elif attention_mode == 'sageattn_varlen':
         return sageattn_varlen_func(q,k,v, q_lens=q_lens, k_lens=k_lens, max_seqlen_k=max_seqlen_k, max_seqlen_q=max_seqlen_q)
     elif attention_mode == 'sageattn_compiled': # for sage versions that allow torch.compile, may be redundant now as other sageattn ops are wrapper in custom ops
@@ -112,6 +169,4 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
     elif attention_mode == 'comfy':
         return optimized_attention(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), heads=heads, skip_reshape=True)
     else: # sdpa
-        if not (q.dtype == k.dtype == v.dtype):
-            return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2).to(q.dtype), v.transpose(1, 2).to(q.dtype), attn_mask=attn_mask).transpose(1, 2).contiguous()
-        return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask).transpose(1, 2).contiguous()
+        return _sdpa_attention(q, k, v, attn_mask=attn_mask)

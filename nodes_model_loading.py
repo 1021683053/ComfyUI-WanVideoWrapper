@@ -5,6 +5,7 @@ from .utils import log, apply_lora
 import numpy as np
 from tqdm import tqdm
 import re
+from importlib import import_module
 
 from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
@@ -1124,9 +1125,24 @@ class WanVideoModelLoader:
 
         if "sage" in attention_mode:
             try:
-                from sageattention import sageattn
+                if attention_mode in {"sageattn_3", "sageattn_3_fp4", "sageattn_3_fp8"}:
+                    for module_name, attr_name in (
+                        ("sageattn3.api", "sageattn3_blackwell"),
+                        ("sageattn3", "sageattn3_blackwell"),
+                        ("sageattn", "sageattn_blackwell"),
+                        ("sageattention", "sageattn_blackwell"),
+                    ):
+                        try:
+                            getattr(import_module(module_name), attr_name)
+                            break
+                        except Exception:
+                            continue
+                    else:
+                        from sageattention import sageattn
+                else:
+                    from sageattention import sageattn
             except Exception as e:
-                raise ValueError(f"Can't import SageAttention: {str(e)}")
+                raise ValueError(f"Can't import SageAttention backend for {attention_mode}: {str(e)}")
 
         gguf = False
         if model.endswith(".gguf"):
@@ -1454,6 +1470,13 @@ class WanVideoModelLoader:
 
             has_multitalk_proj = any(k.startswith("multitalk_audio_proj.") for k in sd.keys())
             is_skyreels_audio = "blocks.1.audio_cross_attn.kv_linear.weight" in sd and "audio_proj.proj1.weight" in sd
+            is_longcat_audio = (
+                "multitalk_audio_proj.proj1.weight" in sd
+                or "multitalk_audio_proj.proj1.weight_int8" in sd
+            ) and (
+                "blocks.0.audio_cross_attn.q_norm.weight" in sd
+                or "blocks.0.audio_cross_attn.q_norm.weight_int8" in sd
+            )
 
             # Some merged models still store the projection weights under audio_proj.*
             if not has_multitalk_proj and not is_skyreels_audio:
@@ -1465,6 +1488,9 @@ class WanVideoModelLoader:
                         for k, v in sd.items()
                     }
                     has_multitalk_proj = True
+
+            if is_longcat_audio or is_skyreels_audio:
+                return False
 
             if not has_multitalk_proj or hasattr(transformer, "multitalk_audio_proj"):
                 return False
@@ -1847,7 +1873,10 @@ class WanVideoModelLoader:
             from .fp8_optimization import convert_fp8_linear
             if "fp4" in quantization:
                 log.info("FP4 fast mode: using FP8 weights with fast matmul and FP4 attention")
-                log.info("Select 'sageattn_3_fp4' in attention_mode for full FP4 acceleration")
+                if attention_mode == "sageattn_3_fp4":
+                    log.info("attention_mode is set to sageattn_3_fp4; Blackwell FP4 attention will be used when the backend is available")
+                else:
+                    log.info(f"Current attention_mode is '{attention_mode}'; select 'sageattn_3_fp4' for full FP4 acceleration")
             convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
         elif "fp4" in quantization:
             if lora is not None and not merge_loras:
@@ -1859,7 +1888,10 @@ class WanVideoModelLoader:
             else:
                 log.info("FP4 experimental mode: using FP8 weights with FP4 attention")
                 convert_fp4_linear(transformer, base_dtype, params_to_keep)
-            log.info("Select 'sageattn_3_fp4' in attention_mode for full FP4 acceleration")
+            if attention_mode == "sageattn_3_fp4":
+                log.info("attention_mode is set to sageattn_3_fp4; Blackwell FP4 attention will be used when the backend is available")
+            else:
+                log.info(f"Current attention_mode is '{attention_mode}'; select 'sageattn_3_fp4' for full FP4 acceleration")
 
         if vram_management_args is not None:
             if gguf:

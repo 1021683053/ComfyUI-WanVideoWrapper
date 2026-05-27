@@ -69,16 +69,35 @@ except Exception:
     sageattn_varlen_func = attention_func_error
 
 # sage3
+SAGE3_BACKEND = None
+
 try:
-    from sageattn3 import sageattn3_blackwell as sageattn_blackwell
+    from sageattn3.api import sageattn3_blackwell as sageattn_blackwell
     SAGE3_AVAILABLE = True
+    SAGE3_BACKEND = "sageattn3.api.sageattn3_blackwell"
 except Exception:
     try:
-        from sageattn import sageattn_blackwell
+        from sageattn3 import sageattn3_blackwell as sageattn_blackwell
         SAGE3_AVAILABLE = True
+        SAGE3_BACKEND = "sageattn3.sageattn3_blackwell"
     except Exception:
-        sageattn_blackwell = attention_func_error
-        SAGE3_AVAILABLE = False
+        try:
+            from sageattn import sageattn_blackwell
+            SAGE3_AVAILABLE = True
+            SAGE3_BACKEND = "sageattn.sageattn_blackwell"
+        except Exception:
+            try:
+                from sageattention import sageattn_blackwell
+                SAGE3_AVAILABLE = True
+                SAGE3_BACKEND = "sageattention.sageattn_blackwell"
+            except Exception:
+                sageattn_blackwell = attention_func_error
+                SAGE3_AVAILABLE = False
+
+if SAGE3_AVAILABLE:
+    log.info(f"SageAttention3 Blackwell backend available via {SAGE3_BACKEND}")
+else:
+    log.warning("SageAttention3 Blackwell backend not available; sageattn_3* modes will fall back to regular SageAttention or SDPA")
 
 try:
     from ...ultravico.sageattn.core import sage_attention as sageattn_ultravico

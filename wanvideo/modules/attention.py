@@ -70,6 +70,8 @@ except Exception:
 
 # sage3
 SAGE3_BACKEND = None
+_SAGE3_FP4_SUCCESS_LOGGED = False
+_SAGE3_FP4_FALLBACK_LOGGED = False
 
 try:
     from sageattn3.api import sageattn3_blackwell as sageattn_blackwell
@@ -128,8 +130,14 @@ def _sdpa_attention(q, k, v, attn_mask=None):
 
 
 def _fallback_sage_attention(q, k, v, attn_mask=None, log_message=None):
+    global _SAGE3_FP4_FALLBACK_LOGGED
     if log_message is not None:
-        log.warning(log_message)
+        if "SageAttention3 FP4" in log_message:
+            if not _SAGE3_FP4_FALLBACK_LOGGED:
+                log.warning(log_message)
+                _SAGE3_FP4_FALLBACK_LOGGED = True
+        else:
+            log.warning(log_message)
     try:
         return sageattn_func(q, k, v, attn_mask=attn_mask, tensor_layout="NHD").contiguous()
     except Exception as e:
@@ -156,10 +164,14 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
             return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
                 log_message=f"SageAttention3 failed: {e}, falling back to regular SageAttention")
     elif attention_mode == 'sageattn_3_fp4':
+        global _SAGE3_FP4_SUCCESS_LOGGED
         if not SAGE3_AVAILABLE or sageattn_blackwell == attention_func_error:
             return _fallback_sage_attention(q, k, v, attn_mask=attn_mask,
                 log_message="SageAttention3 FP4 not available, falling back to regular SageAttention")
         try:
+            if not _SAGE3_FP4_SUCCESS_LOGGED:
+                log.info(f"SageAttention3 FP4 kernel active via {SAGE3_BACKEND}")
+                _SAGE3_FP4_SUCCESS_LOGGED = True
             return sageattn_blackwell(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), per_block_mean=True
             ).transpose(1, 2).contiguous()
